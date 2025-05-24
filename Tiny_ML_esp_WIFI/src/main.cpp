@@ -1,10 +1,7 @@
 /******************************************************************************
  * Inferência TensorFlow Lite Micro no ESP32-C3
  * Modelo de seno — compatível com FLOAT32 **ou** INT8/UINT8
- *
- * ▸ Basta alterar o #define "modelo_seno_tflite" para apontar ao modelo
- *   desejado e recompilar. O código detecta o tipo de tensor em tempo de
- *   execução e faz (de)quantização apenas quando necessário.
+ * API WiFi para cálculo de seno
  ******************************************************************************/
 
 #include <WiFi.h>
@@ -16,6 +13,9 @@
 const char* ssid = "Starlink";
 const char* password = "diversao";
 
+// Servidor web na porta 80
+WebServer server(80);
+
 // ───────── TensorFlow Lite Micro ──────────────────────────────────────────────
 #include "tensorflow/lite/micro/micro_log.h"
 #include "tensorflow/lite/micro/tflite_bridge/micro_error_reporter.h"
@@ -24,12 +24,8 @@ const char* password = "diversao";
 #include "tensorflow/lite/schema/schema_generated.h"
 
 // ───────── Modelo convertido (escolha aqui) ──────────────────────────────────
-//#include "model_seno_data.h"         // nomeado no Python como modelo_seno_int8[]
-//#include "modelo_seno_float32.h"    // se ainda quiser testar o float32
 #include "modelo_seno_float32.h"  
 
-// Se quiser trocar de modelo sem mexer no restante do código,
-// altere apenas estas duas linhas:
 #define modelo_seno_tflite      modelo_seno_float32_tflite
 #define modelo_seno_tflite_len  modelo_seno_float32_tflite_len
 
@@ -98,6 +94,92 @@ float inferirSeno(float x) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// HANDLERS DA API
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Handler para calcular seno
+void handleSeno() {
+  // Verifica se o parâmetro 'angulo' foi enviado
+  if (!server.hasArg("angulo")) {
+    server.send(400, "application/json", "{\"erro\":\"Parâmetro 'angulo' não encontrado\"}");
+    return;
+  }
+
+  // Converte o parâmetro para float
+  float angulo_graus = server.arg("angulo").toFloat();
+  
+  // Converte graus para radianos
+  float angulo_rad = (angulo_graus * M_PI) / 180.0;
+  
+  // Faz a inferência
+  float seno_resultado = inferirSeno(angulo_rad);
+  
+  // Verifica se houve erro na inferência
+  if (isnan(seno_resultado)) {
+    server.send(500, "application/json", "{\"erro\":\"Erro na inferência do modelo\"}");
+    Serial.printf("Erro na inferência para ângulo: %.2f graus\n", angulo_graus);
+    return;
+  }
+  
+  // Imprime no terminal
+  Serial.printf("sin(%.2f°) = %.6f\n", angulo_graus, seno_resultado);
+  
+  // Monta resposta JSON
+  String resposta = "{";
+  resposta += "\"angulo_graus\":" + String(angulo_graus, 2) + ",";
+  resposta += "\"seno\":" + String(seno_resultado, 6);
+  resposta += "}";
+  
+  // Envia resposta
+  server.send(200, "application/json", resposta);
+}
+
+// Handler para página de ajuda
+void handleRoot() {
+  String html = "<html><body>";
+  html += "<h1>API de Cálculo de Seno - ESP32</h1>";
+  html += "<p>Para calcular o seno de um ângulo, use:</p>";
+  html += "<p><strong>GET /seno?angulo=VALOR</strong></p>";
+  html += "<p>Exemplo: <a href='/seno?angulo=30'>/seno?angulo=30</a></p>";
+  html += "<p>Exemplo: <a href='/seno?angulo=45'>/seno?angulo=45</a></p>";
+  html += "<p>Exemplo: <a href='/seno?angulo=90'>/seno?angulo=90</a></p>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// Handler para 404
+void handleNotFound() {
+  server.send(404, "application/json", "{\"erro\":\"Endpoint não encontrado\"}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FUNÇÃO DE TESTE INICIAL
+// ═════════════════════════════════════════════════════════════════════════════
+void testeInicialInferencia() {
+  Serial.println("Executando teste inicial de inferência...");
+  
+  // Ângulos de teste (rad)
+  constexpr float angles[] = { M_PI/3, M_PI/6, M_PI/4, M_PI/2, M_PI };
+  constexpr int   num_angles = sizeof(angles) / sizeof(angles[0]);
+  
+  for (int i = 0; i < num_angles; ++i) {
+    float x = angles[i];
+    float y = inferirSeno(x);
+    
+    // Verifica se houve erro na inferência
+    if (!isnan(y)) {
+      float angulo_graus = (x * 180.0) / M_PI;
+      Serial.printf("sin(%.2f°) = %.6f\n", angulo_graus, y);
+    } else {
+      Serial.printf("Erro na inferência para x=%f\n", x);
+    }
+  }
+  Serial.println("----------------------------");
+  Serial.println("Teste inicial concluído!\n");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // SETUP
 // ═════════════════════════════════════════════════════════════════════════════
 void setup() {
@@ -141,7 +223,7 @@ void setup() {
                 input->type,  in_scale,  in_zp);
   Serial.printf("OUTPUT type=%d  scale=%f  zp=%d\n",
                 output->type, out_scale, out_zp);
-  Serial.println("Setup concluído — modelo pronto para inferir!");
+  Serial.println("Modelo TensorFlow Lite carregado com sucesso!");
 
   // Conecta ao WiFi
   WiFi.begin(ssid, password);
@@ -154,32 +236,29 @@ void setup() {
   
   Serial.println();
   Serial.printf("WiFi conectado! IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // Configura rotas da API
+  server.on("/", handleRoot);
+  server.on("/seno", handleSeno);
+  server.onNotFound(handleNotFound);
+  
+  // Executa teste inicial de inferência
+  testeInicialInferencia();
+
+  // Inicia servidor
+  server.begin();
+  Serial.println("Servidor HTTP iniciado!");
+  Serial.println("Use: GET /seno?angulo=VALOR");
+  Serial.println("Exemplo: http://" + WiFi.localIP().toString() + "/seno?angulo=30");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 // LOOP
 // ═════════════════════════════════════════════════════════════════════════════
 void loop() {
-  // Ângulos de teste (rad)
-  constexpr float angles[] = { M_PI/3, M_PI/6, M_PI/4, M_PI/2, M_PI };
-  constexpr int   num_angles = sizeof(angles) / sizeof(angles[0]);
-
+  // Processa requisições HTTP
+  server.handleClient();
   
-
-
-  for (int i = 0; i < num_angles; ++i) {
-    float x = angles[i];
-    float y = inferirSeno(x);
-    
-    // Verifica se houve erro na inferência
-    if (!isnan(y)) {
-      float angulo_graus = (x * 180.0) / M_PI;
-      Serial.printf("sin(%f) = %f\n", angulo_graus, y);
-    } else {
-      Serial.printf("Erro na inferência para x=%f\n", x);
-    }
-  }
-
-  Serial.println("----------------------------\n");
-  delay(1000);
+  // Pequeno delay para não sobrecarregar
+  delay(2);
 }
