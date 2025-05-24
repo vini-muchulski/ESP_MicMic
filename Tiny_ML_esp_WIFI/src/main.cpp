@@ -2,22 +2,19 @@
  * Inferência TensorFlow Lite Micro no ESP32-C3
  * Modelo de seno — compatível com FLOAT32 **ou** INT8/UINT8
  *
- * ▸ Basta alterar o #define “modelo_seno_tflite” para apontar ao modelo
+ * ▸ Basta alterar o #define "modelo_seno_tflite" para apontar ao modelo
  *   desejado e recompilar. O código detecta o tipo de tensor em tempo de
  *   execução e faz (de)quantização apenas quando necessário.
  ******************************************************************************/
 
- #include <WiFi.h>
+#include <WiFi.h>
 #include <WebServer.h> 
 
 #include <Arduino.h>
 #include <math.h>                     // para M_PI
 
-
 const char* ssid = "Starlink";
 const char* password = "diversao";
-
-
 
 // ───────── TensorFlow Lite Micro ──────────────────────────────────────────────
 #include "tensorflow/lite/micro/micro_log.h"
@@ -58,6 +55,46 @@ namespace {
   float     out_scale  = 1.0f;
   int32_t   out_zp     = 0;
   bool      is_quant   = false;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FUNÇÃO DE INFERÊNCIA
+// ═════════════════════════════════════════════════════════════════════════════
+float inferirSeno(float x) {
+  // ─── 1. Escreve no tensor de entrada ──────────────────────────────────
+  if (is_quant) {
+    int32_t q_in = static_cast<int32_t>(roundf(x / in_scale) + in_zp);
+
+    // Clampa se exceder range do tipo
+    if (input->type == kTfLiteInt8) {
+      q_in = max(-128, min(127, q_in));
+      input->data.int8[0] = static_cast<int8_t>(q_in);
+    } else {                         // UINT8
+      q_in = max(0, min(255, q_in));
+      input->data.uint8[0] = static_cast<uint8_t>(q_in);
+    }
+  } else {
+    input->data.f[0] = x;            // modelo float32 original
+  }
+
+  // ─── 2. Invoke ─────────────────────────────────────────────────────────
+  if (interpreter->Invoke() != kTfLiteOk) {
+    TF_LITE_REPORT_ERROR(error_reporter, "Invoke() falhou.");
+    return NAN; // Retorna NaN em caso de erro
+  }
+
+  // ─── 3. Lê a saída ─────────────────────────────────────────────────────
+  float y;
+  if (is_quant) {
+    int32_t q_out = (output->type == kTfLiteInt8)
+                      ? output->data.int8[0]
+                      : output->data.uint8[0];
+    y = (q_out - out_zp) * out_scale;
+  } else {
+    y = output->data.f[0];
+  }
+
+  return y;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -106,8 +143,6 @@ void setup() {
                 output->type, out_scale, out_zp);
   Serial.println("Setup concluído — modelo pronto para inferir!");
 
-
-
   // Conecta ao WiFi
   WiFi.begin(ssid, password);
   Serial.print("Conectando ao WiFi");
@@ -119,7 +154,6 @@ void setup() {
   
   Serial.println();
   Serial.printf("WiFi conectado! IP: %s\n", WiFi.localIP().toString().c_str());
-
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -127,47 +161,20 @@ void setup() {
 // ═════════════════════════════════════════════════════════════════════════════
 void loop() {
   // Ângulos de teste (rad)
-  constexpr float angles[] = { M_PI/3, M_PI/6, M_PI/4, M_PI/2 ,M_PI };
+  constexpr float angles[] = { M_PI/3, M_PI/6, M_PI/4, M_PI/2, M_PI };
   constexpr int   num_angles = sizeof(angles) / sizeof(angles[0]);
 
   for (int i = 0; i < num_angles; ++i) {
     float x = angles[i];
-
-    // ─── 1. Escreve no tensor de entrada ──────────────────────────────────
-    if (is_quant) {
-      int32_t q_in = static_cast<int32_t>(roundf(x / in_scale) + in_zp);
-
-      // Clampa se exceder range do tipo
-      if (input->type == kTfLiteInt8) {
-        q_in = max(-128, min(127, q_in));
-        input->data.int8[0] = static_cast<int8_t>(q_in);
-      } else {                         // UINT8
-        q_in = max(0, min(255, q_in));
-        input->data.uint8[0] = static_cast<uint8_t>(q_in);
-      }
+    float y = inferirSeno(x);
+    
+    // Verifica se houve erro na inferência
+    if (!isnan(y)) {
+      float angulo_graus = (x * 180.0) / M_PI;
+      Serial.printf("sin(%f) = %f\n", angulo_graus, y);
     } else {
-      input->data.f[0] = x;            // modelo float32 original
+      Serial.printf("Erro na inferência para x=%f\n", x);
     }
-
-    // ─── 2. Invoke ─────────────────────────────────────────────────────────
-    if (interpreter->Invoke() != kTfLiteOk) {
-      TF_LITE_REPORT_ERROR(error_reporter, "Invoke() falhou.");
-      return;
-    }
-
-    // ─── 3. Lê a saída ─────────────────────────────────────────────────────
-    float y;
-    if (is_quant) {
-      int32_t q_out = (output->type == kTfLiteInt8)
-                        ? output->data.int8[0]
-                        : output->data.uint8[0];
-      y = (q_out - out_zp) * out_scale;
-    } else {
-      y = output->data.f[0];
-    }
-
-    // ─── 4. Print ──────────────────────────────────────────────────────────
-    Serial.printf("sin(%f) = %f\n", x, y);
   }
 
   Serial.println("----------------------------");
