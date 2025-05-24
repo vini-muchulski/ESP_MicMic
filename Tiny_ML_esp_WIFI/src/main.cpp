@@ -164,6 +164,9 @@ void loop() {
   constexpr float angles[] = { M_PI/3, M_PI/6, M_PI/4, M_PI/2, M_PI };
   constexpr int   num_angles = sizeof(angles) / sizeof(angles[0]);
 
+  
+
+
   for (int i = 0; i < num_angles; ++i) {
     float x = angles[i];
     float y = inferirSeno(x);
@@ -177,6 +180,6 @@ void loop() {
     }
   }
 
-  Serial.println("----------------------------");
+  Serial.println("----------------------------\n");
   delay(1000);
 }
