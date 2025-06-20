@@ -1,0 +1,252 @@
+#include <Arduino.h>
+#include <cmath>
+#include <climits>
+
+// Verificar se os headers existem
+#ifdef __has_include
+  #if __has_include("mnist_model_data.h")
+    #include "mnist_model_data.h"
+    #define HAS_MODEL_DATA
+  #endif
+  #if __has_include("image_data.h")
+    #include "image_data.h"
+    #define HAS_IMAGE_DATA
+  #endif
+#endif
+
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/tflite_bridge/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+// Model data from external files (se existirem)
+#ifdef HAS_MODEL_DATA
+extern unsigned char mnist_cnn_small_int8_tflite[];
+extern unsigned int mnist_cnn_small_int8_tflite_len;
+#endif
+
+// Dados de teste mockados se não tiver image_data.h
+#ifndef HAS_IMAGE_DATA
+const uint8_t mnist_sample[784] PROGMEM = {0}; // Imagem vazia para teste
+#endif
+
+namespace {
+// Pointers to be initialized in setup()
+tflite::ErrorReporter* error_reporter = nullptr;
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input_tensor = nullptr;
+TfLiteTensor* output_tensor = nullptr;
+
+// Arena configuration
+constexpr int kTensorArenaSize = 80 * 1024;
+uint8_t* tensor_arena = nullptr;
+
+bool model_initialized = false;
+} // namespace
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    
+    Serial.println("\n=== TESTE SERIAL ===");
+    Serial.flush();
+    
+    Serial.printf("Free heap inicial: %d bytes\n", esp_get_free_heap_size());
+    Serial.printf("PSRAM disponível: %d bytes\n", ESP.getPsramSize());
+    Serial.flush();
+
+#ifndef HAS_MODEL_DATA
+    Serial.println("ERRO: mnist_model_data.h não encontrado!");
+    return;
+#endif
+
+    // 1. Initialize ErrorReporter
+    static tflite::MicroErrorReporter micro_error_reporter;
+    error_reporter = &micro_error_reporter;
+
+    Serial.println("=== TFLite MNIST Boot ===");
+    Serial.flush();
+
+    // 2. Carregar modelo para PSRAM
+    Serial.println("[1] Carregando modelo para PSRAM...");
+    Serial.flush();
+    
+    // Alocar buffer no PSRAM para o modelo
+    uint8_t* model_buffer = static_cast<uint8_t*>(
+        heap_caps_malloc(mnist_cnn_small_int8_tflite_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    
+    if (model_buffer != nullptr) {
+        Serial.printf("[1] Copiando modelo (%d bytes) para PSRAM...\n", mnist_cnn_small_int8_tflite_len);
+        memcpy(model_buffer, mnist_cnn_small_int8_tflite, mnist_cnn_small_int8_tflite_len);
+        Serial.println("[1] Modelo copiado para PSRAM");
+        
+        const tflite::Model* loaded_model = tflite::GetModel(model_buffer);
+        if (loaded_model == nullptr) {
+            Serial.println("[1] ERRO: Falha ao carregar modelo do PSRAM");
+            heap_caps_free(model_buffer);
+            return;
+        }
+        model = loaded_model;
+        Serial.println("[1] Modelo carregado do PSRAM");
+    } else {
+        Serial.println("[1] PSRAM insuficiente, usando Flash (mais lento)...");
+        const tflite::Model* loaded_model = tflite::GetModel(mnist_cnn_small_int8_tflite);
+        if (loaded_model == nullptr) {
+            Serial.println("[1] ERRO: Falha ao carregar modelo da Flash");
+            return;
+        }
+        model = loaded_model;
+        Serial.println("[1] Modelo carregado da Flash");
+    }
+    
+    Serial.printf("[1] Schema version: modelo=%d, suportada=%d\n", 
+                  model->version(), TFLITE_SCHEMA_VERSION);
+    
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.printf("[1] ERRO: Versão incompatível: %d vs %d\n",
+                     model->version(), TFLITE_SCHEMA_VERSION);
+        if (model_buffer) heap_caps_free(model_buffer);
+        return;
+    }
+    Serial.flush();
+
+    // 3. Alocar tensor arena
+    Serial.println("[2] Alocando tensor arena...");
+    Serial.flush();
+    
+    tensor_arena = static_cast<uint8_t*>(
+        heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    
+    if (tensor_arena == nullptr) {
+        Serial.println("[2] PSRAM falhou, tentando heap normal...");
+        tensor_arena = static_cast<uint8_t*>(malloc(kTensorArenaSize));
+    }
+    
+    if (tensor_arena == nullptr) {
+        Serial.printf("[2] ERRO: Falha na alocação de %d bytes\n", kTensorArenaSize);
+        if (model_buffer) heap_caps_free(model_buffer);
+        return;
+    }
+    
+    Serial.printf("[2] Arena alocada: %d bytes\n", kTensorArenaSize);
+    Serial.flush();
+
+    // 4. Op Resolver
+    static tflite::MicroMutableOpResolver<10> op_resolver;
+    op_resolver.AddConv2D();
+    op_resolver.AddMaxPool2D();
+    op_resolver.AddReshape();
+    op_resolver.AddFullyConnected();
+    op_resolver.AddSoftmax();
+    op_resolver.AddQuantize();
+    op_resolver.AddDequantize();
+    op_resolver.AddMean();
+    op_resolver.AddMul();
+    op_resolver.AddAdd();
+
+    // 5. Interpreter
+    Serial.println("[3] Construindo interpretador...");
+    static tflite::MicroInterpreter static_interpreter(
+        model, op_resolver, tensor_arena, kTensorArenaSize);
+    interpreter = &static_interpreter;
+
+    Serial.println("[3] Alocando tensores...");
+    TfLiteStatus allocate_status = interpreter->AllocateTensors();
+    if (allocate_status != kTfLiteOk) {
+        Serial.printf("[3] ERRO: AllocateTensors falhou (código: %d)\n", allocate_status);
+        if (model_buffer) heap_caps_free(model_buffer);
+        return;
+    }
+    Serial.flush();
+
+    // 6. Tensor pointers
+    input_tensor = interpreter->input(0);
+    output_tensor = interpreter->output(0);
+
+    if (input_tensor == nullptr || output_tensor == nullptr) {
+        Serial.println("[4] ERRO: Ponteiros de tensor nulos");
+        if (model_buffer) heap_caps_free(model_buffer);
+        return;
+    }
+
+    Serial.printf("[4] Input: %d bytes, tipo %d\n", input_tensor->bytes, input_tensor->type);
+    Serial.printf("[4] Output: %d bytes, tipo %d\n", output_tensor->bytes, output_tensor->type);
+    Serial.printf("[4] Arena usada: %d/%d bytes\n", 
+                  interpreter->arena_used_bytes(), kTensorArenaSize);
+    Serial.printf("[4] Heap livre: %d bytes\n", esp_get_free_heap_size());
+    Serial.flush();
+    
+    model_initialized = true;
+    Serial.println("[✓] Setup COMPLETO!\n");
+    Serial.flush();
+}
+
+void loop() {
+    if (!model_initialized) {
+        Serial.println("Modelo não inicializado, aguardando...");
+        Serial.flush();
+        delay(1000);
+        return;
+    }
+
+    Serial.println("=== EXECUTANDO INFERÊNCIA ===");
+    Serial.flush();
+
+    constexpr int kImageSize = 28 * 28;
+
+    // Input Quantization
+    const float input_scale = input_tensor->params.scale;
+    const int32_t input_zero_point = input_tensor->params.zero_point;
+
+    Serial.printf("Escala input: %f, zero point: %d\n", input_scale, input_zero_point);
+    Serial.flush();
+
+    for (int i = 0; i < kImageSize; ++i) {
+        uint8_t pixel = pgm_read_byte(&mnist_sample[i]);
+        float normalized_pixel = pixel / 255.0f;
+        int32_t quantized_value = static_cast<int32_t>(roundf(normalized_pixel / input_scale) + input_zero_point);
+        quantized_value = max(-128, min(127, quantized_value));
+        input_tensor->data.int8[i] = static_cast<int8_t>(quantized_value);
+    }
+
+    // Invoke
+    Serial.println("Executando modelo...");
+    Serial.flush();
+    
+    TfLiteStatus invoke_status = interpreter->Invoke();
+    if (invoke_status != kTfLiteOk) {
+        Serial.printf("ERRO: Invoke falhou (código: %d)\n", invoke_status);
+        Serial.flush();
+        delay(3000);
+        return;
+    }
+
+    // Output Analysis
+    int best_index = 0;
+    int8_t max_score = SCHAR_MIN;
+    const int output_size = output_tensor->dims->data[1];
+
+    Serial.printf("Tamanho output: %d\n", output_size);
+    Serial.flush();
+
+    for (int i = 0; i < output_size; ++i) {
+        if (output_tensor->data.int8[i] > max_score) {
+            max_score = output_tensor->data.int8[i];
+            best_index = i;
+        }
+    }
+    
+    const float output_scale = output_tensor->params.scale;
+    const int32_t output_zero_point = output_tensor->params.zero_point;
+    float best_score_float = (static_cast<float>(max_score) - output_zero_point) * output_scale;
+
+    Serial.println("=== RESULTADO ===");
+    Serial.printf("Predição: %d\n", best_index);
+    //Serial.printf("Score (quantizado): %d\n", max_score);
+    Serial.printf("Score (float): %.6f\n", best_score_float);
+    Serial.println("==================\n");
+    Serial.flush();
+
+    delay(5000);
+}

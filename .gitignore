@@ -1,2 +1,10 @@
 /Tiny_ML_esp_WIFI/include
 /Tiny_ML_esp_WIFI/lib
+/MNIST_digitos/esp_mnist_digitos/backups/tflite-lib/tensorflow
+/MNIST_digitos/esp_mnist_digitos/lib/tflite-lib
+/MNIST_digitos/esp_mnist_digitos_wifi/lib/BACKUP/tflite-lib
+/MNIST_digitos/esp_mnist_digitos_wifi/lib/tflite-lib
+/Tiny_ML_Seno/Tiny_ML_esp_WIFI/lib/tflite-lib
+/Winrar/Winrar/esp_mnist_digitos/backups/tflite-lib
+/Winrar/Winrar/esp_mnist_digitos/lib/tflite-lib
+/MNIST_digitos/esp_mnist_digitos/backups/tflite-lib

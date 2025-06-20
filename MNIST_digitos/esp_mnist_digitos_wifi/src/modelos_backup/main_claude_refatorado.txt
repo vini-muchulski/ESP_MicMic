@@ -1,0 +1,306 @@
+#include <Arduino.h>
+#include <cmath>
+#include <climits>
+
+// Verificar se os headers existem
+#ifdef __has_include
+  #if __has_include("mnist_model_data.h")
+    #include "mnist_model_data.h"
+    #define HAS_MODEL_DATA
+  #endif
+  #if __has_include("image_data.h")
+    #include "image_data.h"
+    #define HAS_IMAGE_DATA
+  #endif
+#endif
+
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/tflite_bridge/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+// Model data from external files (se existirem)
+#ifdef HAS_MODEL_DATA
+extern unsigned char mnist_cnn_small_int8_tflite[];
+extern unsigned int mnist_cnn_small_int8_tflite_len;
+#endif
+
+// Dados de teste mockados se não tiver image_data.h
+#ifndef HAS_IMAGE_DATA
+const uint8_t mnist_sample[784] PROGMEM = {0}; // Imagem vazia para teste
+#endif
+
+// Estrutura para gerenciar o modelo
+struct MNISTModel {
+    tflite::ErrorReporter* error_reporter;
+    const tflite::Model* model;
+    tflite::MicroInterpreter* interpreter;
+    TfLiteTensor* input_tensor;
+    TfLiteTensor* output_tensor;
+    uint8_t* tensor_arena;
+    uint8_t* model_buffer;
+    bool initialized;
+    
+    static constexpr int kTensorArenaSize = 80 * 1024;
+    static constexpr int kImageSize = 28 * 28;
+};
+
+// Instância global do modelo
+MNISTModel mnist_model = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false};
+
+// Declarações das funções
+void cleanup_model();
+
+// Função para limpeza de memória
+void cleanup_model() {
+    if (mnist_model.model_buffer) {
+        free(mnist_model.model_buffer);
+        mnist_model.model_buffer = nullptr;
+    }
+    if (mnist_model.tensor_arena) {
+        free(mnist_model.tensor_arena);
+        mnist_model.tensor_arena = nullptr;
+    }
+    mnist_model.initialized = false;
+}
+
+// Função para alocar memória preferindo PSRAM
+void* allocate_memory(size_t size) {
+    void* ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ptr == nullptr) {
+        ptr = malloc(size);
+    }
+    return ptr;
+}
+
+// Função para carregar o modelo
+bool load_model() {
+#ifndef HAS_MODEL_DATA
+    Serial.println("ERRO: mnist_model_data.h não encontrado!");
+    return false;
+#endif
+
+    Serial.println("[1] Carregando modelo...");
+    
+    // Tentar carregar modelo no PSRAM
+    mnist_model.model_buffer = static_cast<uint8_t*>(
+        allocate_memory(mnist_cnn_small_int8_tflite_len));
+    
+    if (mnist_model.model_buffer != nullptr) {
+        Serial.printf("Copiando modelo (%d bytes) para memória...\n", mnist_cnn_small_int8_tflite_len);
+        memcpy(mnist_model.model_buffer, mnist_cnn_small_int8_tflite, mnist_cnn_small_int8_tflite_len);
+        mnist_model.model = tflite::GetModel(mnist_model.model_buffer);
+    } else {
+        Serial.println("Usando modelo diretamente da Flash...");
+        mnist_model.model = tflite::GetModel(mnist_cnn_small_int8_tflite);
+    }
+    
+    if (mnist_model.model == nullptr) {
+        Serial.println("ERRO: Falha ao carregar modelo");
+        return false;
+    }
+    
+    if (mnist_model.model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.printf("ERRO: Versão incompatível: %d vs %d\n",
+                     mnist_model.model->version(), TFLITE_SCHEMA_VERSION);
+        return false;
+    }
+    
+    Serial.println("Modelo carregado com sucesso");
+    return true;
+}
+
+// Função para inicializar o interpretador
+bool initialize_interpreter() {
+    Serial.println("[2] Inicializando interpretador...");
+    
+    // Alocar tensor arena
+    mnist_model.tensor_arena = static_cast<uint8_t*>(
+        allocate_memory(MNISTModel::kTensorArenaSize));
+    
+    if (mnist_model.tensor_arena == nullptr) {
+        Serial.printf("ERRO: Falha na alocação de %d bytes\n", MNISTModel::kTensorArenaSize);
+        return false;
+    }
+    
+    // Configurar op resolver
+    static tflite::MicroMutableOpResolver<10> op_resolver;
+    op_resolver.AddConv2D();
+    op_resolver.AddMaxPool2D();
+    op_resolver.AddReshape();
+    op_resolver.AddFullyConnected();
+    op_resolver.AddSoftmax();
+    op_resolver.AddQuantize();
+    op_resolver.AddDequantize();
+    op_resolver.AddMean();
+    op_resolver.AddMul();
+    op_resolver.AddAdd();
+    
+    // Criar interpretador
+    static tflite::MicroInterpreter static_interpreter(
+        mnist_model.model, op_resolver, mnist_model.tensor_arena, MNISTModel::kTensorArenaSize);
+    mnist_model.interpreter = &static_interpreter;
+    
+    // Alocar tensores
+    TfLiteStatus allocate_status = mnist_model.interpreter->AllocateTensors();
+    if (allocate_status != kTfLiteOk) {
+        Serial.printf("ERRO: AllocateTensors falhou (código: %d)\n", allocate_status);
+        return false;
+    }
+    
+    // Obter ponteiros dos tensores
+    mnist_model.input_tensor = mnist_model.interpreter->input(0);
+    mnist_model.output_tensor = mnist_model.interpreter->output(0);
+    
+    if (mnist_model.input_tensor == nullptr || mnist_model.output_tensor == nullptr) {
+        Serial.println("ERRO: Ponteiros de tensor nulos");
+        return false;
+    }
+    
+    Serial.printf("Arena usada: %d/%d bytes\n", 
+                  mnist_model.interpreter->arena_used_bytes(), MNISTModel::kTensorArenaSize);
+    Serial.println("Interpretador inicializado com sucesso");
+    return true;
+}
+
+// Função para inicializar o modelo completo
+bool initialize_mnist_model() {
+    Serial.println("=== Inicializando Modelo MNIST ===");
+    
+    // Inicializar error reporter
+    static tflite::MicroErrorReporter micro_error_reporter;
+    mnist_model.error_reporter = &micro_error_reporter;
+    
+    if (!load_model()) {
+        return false;
+    };
+    
+    if (!initialize_interpreter()) {
+        cleanup_model();
+        return false;
+    }
+    
+    mnist_model.initialized = true;
+    Serial.println("=== Modelo inicializado com sucesso ===\n");
+    return true;
+}
+
+// Função para preprocessar a imagem
+void preprocess_image(const uint8_t* image_data) {
+    const float input_scale = mnist_model.input_tensor->params.scale;
+    const int32_t input_zero_point = mnist_model.input_tensor->params.zero_point;
+    
+    for (int i = 0; i < MNISTModel::kImageSize; ++i) {
+        uint8_t pixel = pgm_read_byte(&image_data[i]);
+        float normalized_pixel = pixel / 255.0f;
+        int32_t quantized_value = static_cast<int32_t>(
+            roundf(normalized_pixel / input_scale) + input_zero_point);
+        quantized_value = max(-128, min(127, quantized_value));
+        mnist_model.input_tensor->data.int8[i] = static_cast<int8_t>(quantized_value);
+    }
+}
+
+// Estrutura para resultado da inferência
+struct InferenceResult {
+    int predicted_digit;
+    float confidence;
+    bool success;
+};
+
+// Função para fazer inferência
+InferenceResult run_inference(const uint8_t* image_data = mnist_sample) {
+    InferenceResult result = {-1, 0.0f, false};
+    
+    if (!mnist_model.initialized) {
+        Serial.println("ERRO: Modelo não inicializado");
+        return result;
+    }
+    
+    // Preprocessar imagem
+    preprocess_image(image_data);
+    
+    // Executar inferência
+    TfLiteStatus invoke_status = mnist_model.interpreter->Invoke();
+    if (invoke_status != kTfLiteOk) {
+        Serial.printf("ERRO: Invoke falhou (código: %d)\n", invoke_status);
+        return result;
+    }
+    
+    // Analisar resultado
+    int best_index = 0;
+    int8_t max_score = SCHAR_MIN;
+    const int output_size = mnist_model.output_tensor->dims->data[1];
+    
+    for (int i = 0; i < output_size; ++i) {
+        if (mnist_model.output_tensor->data.int8[i] > max_score) {
+            max_score = mnist_model.output_tensor->data.int8[i];
+            best_index = i;
+        }
+    }
+    
+    // Converter score para float
+    const float output_scale = mnist_model.output_tensor->params.scale;
+    const int32_t output_zero_point = mnist_model.output_tensor->params.zero_point;
+    float confidence = (static_cast<float>(max_score) - output_zero_point) * output_scale;
+    
+    result.predicted_digit = best_index;
+    result.confidence = confidence;
+    result.success = true;
+    
+    return result;
+}
+
+
+
+// Função para imprimir status do modelo
+void print_model_status() {
+    Serial.printf("Modelo inicializado: %s\n", mnist_model.initialized ? "SIM" : "NÃO");
+    if (mnist_model.initialized) {
+        Serial.printf("Input: %d bytes, tipo %d\n", 
+                     mnist_model.input_tensor->bytes, mnist_model.input_tensor->type);
+        Serial.printf("Output: %d bytes, tipo %d\n", 
+                     mnist_model.output_tensor->bytes, mnist_model.output_tensor->type);
+    }
+    Serial.printf("Heap livre: %d bytes\n", esp_get_free_heap_size());
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    
+    Serial.println("\n=== MNIST TensorFlow Lite ===");
+    Serial.printf("Free heap inicial: %d bytes\n", esp_get_free_heap_size());
+    Serial.printf("PSRAM disponível: %d bytes\n", ESP.getPsramSize());
+    
+    // Inicializar modelo
+    if (!initialize_mnist_model()) {
+        Serial.println("Falha na inicialização do modelo!");
+        return;
+    }
+    
+    print_model_status();
+}
+
+void loop() {
+    if (!mnist_model.initialized) {
+        Serial.println("Modelo não inicializado, aguardando...");
+        delay(1000);
+        return;
+    }
+
+    Serial.println("=== EXECUTANDO INFERÊNCIA ===");
+    
+    // Executar inferência
+    InferenceResult result = run_inference();
+    
+    if (result.success) {
+        Serial.println("=== RESULTADO ===");
+        Serial.printf("Predição: %d\n", result.predicted_digit);
+        Serial.printf("Confiança: %.6f\n", result.confidence);
+        Serial.println("==================\n");
+    } else {
+        Serial.println("Falha na inferência");
+    }
+    
+    delay(5000);
+}
